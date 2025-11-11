@@ -3,27 +3,40 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from config import temp
 from database import db
-from .utils import STS, get_readable_time, progress_message_content
+from .utils import get_readable_time, progress_message_content
 from translation import Translation
 
 
 @Client.on_message(filters.private & filters.command(['tasks']))
 async def tasks_command(client, message):
     user_id = message.from_user.id
-    active_task = temp.ACTIVE_TASKS.get(user_id)
     
-    if not active_task:
+    # We check the DB for any running tasks for this user
+    active_tasks_docs = await db.tasks.find({
+        'user_id': user_id, 
+        'status': 'running'
+    }).to_list(length=10)
+    
+    if not active_tasks_docs:
         return await message.reply_text("You have no active tasks.")
         
-    for task_id, task_data in active_task.items():
-        sts = STS(task_id).get(full=True)
-        if not sts: continue
-
-        start_time = task_data.get("start_time", sts.get('start'))
-        text, buttons = progress_message_content(sts, start_time, task_id, done=False)
+    for task_doc in active_tasks_docs:
+        task_id = task_doc['_id']
+        
+        # Check if we have a live message to edit
+        live_task_info = temp.ACTIVE_TASKS.get(user_id, {}).get(task_id)
+        
+        text, buttons = progress_message_content(task_doc, done=False)
+        
+        reply_text = f"**Active Task:** `{task_id}`\n\n{text}"
+        
+        # If it's in ACTIVE_TASKS, it's live. If not, it's a resumed task
+        # that was probably started before a restart.
+        if not live_task_info:
+            reply_text = f"**(Resumed) {reply_text}"
         
         await message.reply_text(
-            f"**Active Task Found:**\n\n{text}",
+            reply_text,
             reply_markup=buttons
         )
 
