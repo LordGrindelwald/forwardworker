@@ -13,7 +13,7 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait 
 
 # --- ADD THESE IMPORTS ---
-from plugins.forward_engine import WorkerManager, resilient_start_clone, robust_access_check, cancel_checker
+from plugins.forward_engine import resilient_start_clone, robust_access_check
 from plugins.utils import edit_progress
 # -------------------------
 
@@ -65,94 +65,26 @@ class Bot(Client):
         await super().stop()
         logging.info("Bot has stopped.")
 
-    async def resume_task(self, task_doc):
-        """
-        The core logic to resume a single task.
-        """
-        user_id = task_doc['user_id']
-        task_id = task_doc['_id']
-        self.log.info(f"Resuming task {task_id} for user {user_id}")
-        
-        # Default message handle. We send a NEW message.
-        m = None
-        valid_operators = []
-
-        try:
-            # Send a new message to the user
-            m = await self.send_message(
-                user_id,
-                f"🔄 **Task Resumed**\n\nBot restarted. Resuming task `{task_id}` from its last known progress. Please wait..."
-            )
-            
-            operator_configs = await db.get_bots(user_id)
-            if not operator_configs:
-                raise ValueError("No operators found for this user.")
-            
-            results = await asyncio.gather(*[resilient_start_clone(c) for c in operator_configs])
-            all_operator_clients = [client for client, error in results if client]
-            
-            failed_operator_details = []
-            for client in all_operator_clients:
-                source_ok, source_err = await robust_access_check(client, task_doc['from_chat_id'])
-                target_ok, target_err = await robust_access_check(client, task_doc['to_chat_id'])
-                if source_ok and target_ok:
-                    valid_operators.append(client)
-                else:
-                    err_detail = source_err if not source_ok else target_err
-                    failed_operator_details.append(f"`{client.me.first_name}` ({err_detail})")
-            
-            if not valid_operators:
-                raise ValueError("No operators could access the required chats.")
-
-            if failed_operator_details:
-                await self.send_message(user_id, f"⚠️ **Warning:** The following operators failed access checks and will be skipped for resumed task `{task_id}`:\n- " + "\n- ".join(failed_operator_details))
-            
-            # Store the new message for updates
-            temp.ACTIVE_TASKS.setdefault(user_id, {})[task_id] = {"process": m, "start_time": task_doc['start_time']}
-            temp.lock[user_id] = True
-            
-            # Start the manager and helper tasks
-            reporter_task = asyncio.create_task(edit_progress(m, task_id))
-            manager = WorkerManager(valid_operators, task_doc, task_doc['configs'])
-            cancel_task = asyncio.create_task(cancel_checker(task_id, manager))
-            
-            await manager.start()
-            
-        except Exception as e:
-            self.log.error(f"Failed to resume task {task_id}: {e}", exc_info=True)
-            await db.tasks.update_one({'_id': task_id}, {'$set': {'status': 'failed', 'error': str(e)}})
-            if user_id:
-                try:
-                    await self.send_message(user_id, f"**TASK FAILED**\n\nFailed to resume task `{task_id}`. \n**Reason:** `{e}`")
-                except Exception as e2:
-                    self.log.error(f"Failed to send resume-fail message to user {user_id}: {e2}")
-        finally:
-            if 'reporter_task' in locals(): reporter_task.cancel()
-            if 'cancel_task' in locals(): cancel_task.cancel()
-            
-            if m: # Update the new message one last time
-                await edit_progress(m, task_id, done=True)
-            
-            # Stop all clients started for this task
-            await asyncio.gather(*[client.stop() for client in valid_operators if client.is_connected], return_exceptions=True)
-            
-            if user_id in temp.ACTIVE_TASKS:
-                temp.ACTIVE_TASKS.pop(user_id, None)
-            temp.CANCEL.pop(task_id, None)
-            temp.lock.pop(user_id, None)
-            self.log.info(f"Cleanup for resumed task {task_id} complete.")
-
     async def resume_running_tasks(self):
         """
-        Finds all 'running' tasks in the DB and creates asyncio tasks to resume them.
+        Finds all 'running' or 'paused' sub-tasks in the DB and 
+        creates asyncio tasks to resume them.
         """
-        self.log.info("Checking for incomplete tasks to restart...")
+        self.log.info("Checking for incomplete sub-tasks to restart...")
         try:
-            tasks_to_restart = await db.tasks.find({'status': 'running'}).to_list(None)
-            self.log.info(f"Found {len(tasks_to_restart)} tasks to resume.")
+            # We must import the worker function here, inside the method
+            from plugins.forward_engine import run_partition_worker 
+        
+            # Find all sub-tasks that are not completed
+            sub_tasks_to_restart = await db.sub_tasks.find(
+                {'status': {'$ne': 'completed'}}
+            ).to_list(None)
             
-            for task_doc in tasks_to_restart:
-                asyncio.create_task(self.resume_task(task_doc))
+            self.log.info(f"Found {len(sub_tasks_to_restart)} sub-tasks to resume.")
+            
+            for sub_task_doc in sub_tasks_to_restart:
+                self.log.info(f"Resuming sub-task {sub_task_doc['_id']} for operator {sub_task_doc['operator_config']['id']}")
+                asyncio.create_task(run_partition_worker(sub_task_doc))
                 
         except Exception as e:
-            self.log.error(f"Failed to query tasks for restart: {e}", exc_info=True)
+            self.log.error(f"Failed to query sub-tasks for restart: {e}", exc_info=True)
