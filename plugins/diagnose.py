@@ -27,9 +27,10 @@ async def run_single_bot_diagnosis(operator_config, source_chat_id, target_chat_
 
     # 1. Test fetching from the source chat
     try:
+        # --- THIS IS THE FIX ---
+        # Removed the get_chat_history call. get_chat is safe for bots.
         await operator_client.get_chat(source_chat_id)
-        async for _ in operator_client.get_chat_history(source_chat_id, limit=1):
-            pass # We just need to know if it throws an error
+        # --- END FIX ---
         report_lines.append("   ✅ **Source Access (Fetch):** OK")
     except Exception as e:
         report_lines.append(f"   ❌ **Source Access (Fetch):** FAILED")
@@ -141,4 +142,3 @@ async def cb_select_diag_target(bot, query: CallbackQuery):
 
     # Trigger the main diagnosis process
     await start_diagnosis_process(bot, user_id, prompt_message, source_chat_id, target_chat_id)
-

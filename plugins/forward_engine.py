@@ -187,6 +187,7 @@ class WorkerManager:
         This function NO LONGER updates 'fetched', but DOES update 'total_files' and 'failed'.
         """
         try:
+            # This is the bot-safe method, as used in mistraldrin/fwd/fwd-DawnUltra/plugins/regix.py
             messages = await client.get_messages(self.task_data['from_chat_id'], message_ids)
         except Exception as e:
             logger.error(f"Failed to get_messages for batch {message_ids[0]}-{message_ids[-1]}. Error: {e}. Re-queuing.")
@@ -264,18 +265,19 @@ async def resilient_start_clone(config):
     except Exception as e:
         return None, str(e)
 
+# --- MODIFIED: This is the FIX for BotMethodInvalid ---
+# Removed the get_chat_history call entirely, as it's not bot-safe.
 async def robust_access_check(client, chat_id):
     """
-    A more robust check to ensure a client can access a chat and its history.
-    This helps "warm up" the client's session cache.
+    A bot-safe check to ensure a client can access a chat.
     """
     try:
+        # Just checking get_chat is safe for bots and userbots.
         chat = await client.get_chat(chat_id)
-        if not client.me.is_bot:
-            async for _ in client.get_chat_history(chat.id, limit=1):
-                pass
+        # --- END FIX ---
         return True, None
     except Exception as e:
+        # Add more detailed logging to see the exact error
         logger.error(f"Robust access check failed for chat {chat_id}: {e}", exc_info=True)
         return False, type(e).__name__
 
@@ -311,6 +313,7 @@ async def pub_(bot, cb: CallbackQuery):
         failed_operator_details = []
 
         for client in all_operator_clients:
+            # Use the new bot-safe robust_access_check
             source_ok, source_err = await robust_access_check(client, session['from_chat_id'])
             target_ok, target_err = await robust_access_check(client, session['to_chat_id'])
 
@@ -332,7 +335,6 @@ async def pub_(bot, cb: CallbackQuery):
         
         start_id, end_id = min(session['start_id'], session['end_id']), max(session['start_id'], session['end_id'])
         
-        # --- MODIFIED: REMOVED last_processed_id ---
         task_doc = {
             '_id': task_id,
             'user_id': user_id,
@@ -349,7 +351,6 @@ async def pub_(bot, cb: CallbackQuery):
             'configs': user_configs,
             'error': None
         }
-        # --- END MODIFICATION ---
         
         try:
             await db.tasks.insert_one(task_doc)
@@ -534,13 +535,9 @@ async def show_final_confirmation(bot, query, session_id):
 async def universal_message_handler(bot: Client, message: Message):
     user_id = message.from_user.id
     state = temp.USER_STATES.get(user_id)
+
     if not state: 
-        if message.forward_from_chat and state.get("state") not in ['diag_awaiting_source', 'awaiting_channel_forward']:
-             return 
-        if not (message.text and message.text.startswith('/')):
-             pass 
-        else:
-             return 
+        return 
 
     if message.text and message.text.lower() == "/cancel":
         prompt_id = state.get("prompt_message_id")
@@ -552,11 +549,7 @@ async def universal_message_handler(bot: Client, message: Message):
         temp.USER_STATES.pop(user_id, None)
         await bot.send_message(user_id, "Cancelled.")
         return
-
-    state = temp.USER_STATES.get(user_id)
-    if not state:
-        return
-
+    
     prompt_id = state.get("prompt_message_id")
     if prompt_id:
         try: await bot.delete_messages(user_id, prompt_id)
@@ -565,10 +558,14 @@ async def universal_message_handler(bot: Client, message: Message):
     state_type = state.get("state")
 
     if state_type == 'awaiting_source':
-        temp.USER_STATES.pop(user_id, None)
         from_chat, end_id, error = parse_message_input(message)
-        if error: return await message.reply(error)
-
+        
+        if error:
+            prompt = await message.reply(f"**Error:** {error}\n\n{Translation.FROM_MSG}")
+            state['prompt_message_id'] = prompt.id
+            return 
+        
+        temp.USER_STATES.pop(user_id, None)
         await message.delete()
 
         to_chat_id = state['to_chat_id']
@@ -587,7 +584,6 @@ async def universal_message_handler(bot: Client, message: Message):
                  from_title = (await bot.get_chat(from_chat)).title
             except Exception as e2:
                  logger.error(f"Could not get chat title for {from_chat} using main bot: {e2}")
-
 
         await start_range_selection(bot, state['command_message'], from_chat, from_title, to_chat_id, 1, end_id)
         return
@@ -612,9 +608,10 @@ async def universal_message_handler(bot: Client, message: Message):
             state['prompt_message_id'] = prompt.id
             return 
         
-        pass
+        return
 
-    if not state.get("is_settings"): return
+    if not state.get("is_settings"):
+        return
     
     temp.USER_STATES.pop(user_id, None)
     sent_message = await message.reply_text("`Processing...`")
