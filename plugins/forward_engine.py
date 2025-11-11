@@ -21,7 +21,7 @@ from pyrogram.errors import FloodWait, MessageNotModified
 
 SYD = ["https://files.catbox.moe/3lwlbm.png"]
 logger = logging.getLogger(__name__)
-BATCH_SIZE = 100
+BATCH_SIZE = 100 # This is now the "claim size"
 OPERATOR_START_TIMEOUT = 30
 
 def generate_short_id(length=8):
@@ -67,138 +67,156 @@ class WorkerManager:
         self.delay = configs.get('forward_delay', 0.5)
         self.cooldown_workers = {}
         self.is_cancelled = False
-        
-        # This is a *local* queue for handling retries (like FloodWait)
-        # It is *not* the main task queue.
-        self.job_queue = deque()
-        self.task_is_done = False # Flag to stop populate_queue
+        self.task_is_done = False # Flag to stop new work
+        # This lock ensures only one worker is claiming from the DB at a time
+        self.db_lock = asyncio.Lock() 
 
-    async def populate_queue(self):
+    # --- NEW: ATOMIC, RESUME-SAFE BATCH CLAIMING ---
+    async def claim_next_batch(self):
         """
-        Fetches the next batch of work from the DB and claims it.
+        Atomically claims the next batch from the database.
+        This is the *only* function that touches the 'fetched' count for claiming.
+        Returns (message_ids_batch, is_done)
         """
-        if self.task_is_done:
-            return
+        async with self.db_lock:
+            if self.task_is_done:
+                return None, True
 
-        # Find and update the task doc atomically to "claim" a batch
-        # This prevents multiple workers from grabbing the same batch on restart
-        updated_doc = await db.tasks.find_one_and_update(
-            {'_id': self.task_id, 'status': 'running'},
-            {'$set': {}}, # No real update, just want to get the doc
-            upsert=False,
-            return_document=True
-        )
+            # Get the *current* state from the DB
+            task_doc = await db.tasks.find_one(
+                {'_id': self.task_id, 'status': 'running'}
+            )
 
-        if not updated_doc:
-            logger.warning(f"Task {self.task_id} not found or not running. Stopping population.")
-            self.task_is_done = True
-            return
+            if not task_doc:
+                self.task_is_done = True
+                return None, True
 
-        self.task_data = updated_doc # Refresh our data cache
-        
-        current_id = self.task_data['last_processed_id'] + 1
-        end_id = self.task_data['end_id']
+            current_fetched = task_doc['fetched']
+            total_messages = task_doc['total_messages']
+            start_id = task_doc['start_id']
+            end_id = task_doc['end_id']
 
-        if current_id > end_id:
-            logger.info(f"Task {self.task_id} has no more messages to process.")
-            self.task_is_done = True
-            # Mark task as completed if truly finished
-            if self.task_data['fetched'] >= self.task_data['total_messages']:
-                await db.tasks.update_one({'_id': self.task_id}, {'$set': {'status': 'completed'}})
-            return
-        
-        batch_end_id = min(current_id + BATCH_SIZE - 1, end_id)
-        message_ids_batch = list(range(current_id, batch_end_id + 1))
-        
-        # Atomically update last_processed_id to "claim" this batch
-        await db.tasks.update_one(
-            {'_id': self.task_id},
-            {'$set': {'last_processed_id': batch_end_id}}
-        )
-        
-        self.job_queue.append(message_ids_batch)
-        logger.info(f"Task {self.task_id}: Populated queue with batch {current_id}-{batch_end_id}")
+            if current_fetched >= total_messages:
+                self.task_is_done = True
+                return None, True
+
+            # Calculate the next batch
+            messages_in_batch = min(BATCH_SIZE, total_messages - current_fetched)
+            new_fetched_count = current_fetched + messages_in_batch
+            
+            # Atomically update the fetched count
+            await db.tasks.update_one(
+                {'_id': self.task_id},
+                {'$set': {'fetched': new_fetched_count}}
+            )
+
+            # Calculate the message IDs for this claimed batch
+            batch_start_msg_id = start_id + current_fetched
+            batch_end_msg_id = start_id + new_fetched_count - 1
+            
+            message_ids_batch = list(range(batch_start_msg_id, batch_end_msg_id + 1))
+            
+            logger.info(f"Task {self.task_id}: Claimed batch {batch_start_msg_id}-{batch_end_msg_id}")
+            return message_ids_batch, False
 
     async def start(self):
+        """
+        Starts worker tasks that pull from the atomic claim function.
+        """
         logger.info(f"WorkerManager started for task {self.task_id} with {len(self.clients)} workers.")
         
-        while (self.job_queue or not self.task_is_done or self.cooldown_workers) and not self.is_cancelled:
-            self.check_cooldowns()
-
-            if not self.job_queue:
-                if not self.task_is_done:
-                    await self.populate_queue()
-                if not self.job_queue: # Still no jobs, wait
-                    await asyncio.sleep(1)
-                    continue
-            
-            if not self.clients:
-                await asyncio.sleep(1)
-                continue
-
-            active_client = self.clients.popleft()
-            message_id_batch = self.job_queue.popleft()
-
-            try:
-                # process_batch will now return True/False based on worker health
-                worker_ok = await self.process_batch(active_client, message_id_batch)
-                if worker_ok:
-                    self.clients.append(active_client)
-            except Exception as e:
-                # This is an unexpected error in the manager loop itself
-                logger.error(f"Worker {active_client.me.first_name} had an unexpected failure: {type(e).__name__}. Re-queuing batch.", exc_info=True)
-                self.cooldown_workers[active_client] = asyncio.get_running_loop().time() + 10 # 10s cooldown
-                self.job_queue.appendleft(message_id_batch) # Re-queue the whole batch
+        # Create a worker task for each available client
+        worker_tasks = []
+        for client in self.clients:
+            worker_tasks.append(
+                asyncio.create_task(self.worker_loop(client))
+            )
+        
+        # Wait for all worker tasks to complete
+        await asyncio.gather(*worker_tasks)
 
         logger.info(f"WorkerManager for task {self.task_id} stopping.")
+        
         if self.is_cancelled:
-            await db.tasks.update_one({'_id': self.task_id, 'status': 'cancelled'})
-        elif self.task_is_done:
-             # Final check to ensure all messages were fetched
+            await db.tasks.update_one({'_id': self.task_id}, {'$set': {'status': 'cancelled'}})
+        else:
+             # Final check
              final_doc = await db.tasks.find_one({'_id': self.task_id})
-             if final_doc and final_doc['last_processed_id'] >= final_doc['end_id']:
+             if final_doc and final_doc['fetched'] >= final_doc['total_messages']:
                 await db.tasks.update_one({'_id': self.task_id}, {'$set': {'status': 'completed'}})
 
+    async def worker_loop(self, client):
+        """
+        A single worker's processing loop.
+        It will continuously claim and process batches until the task is done.
+        """
+        while not self.is_cancelled and not self.task_is_done:
+            # Check if this worker is on cooldown
+            if client in self.cooldown_workers:
+                if time.time() < self.cooldown_workers[client]:
+                    await asyncio.sleep(1) # Wait if on cooldown
+                    continue
+                else:
+                    logger.info(f"Worker {client.me.first_name} cooldown finished.")
+                    del self.cooldown_workers[client] # Cooldown over
+
+            # Claim the next available batch
+            message_ids_batch, is_done = await self.claim_next_batch()
+
+            if is_done:
+                break # No more work
+
+            if message_ids_batch:
+                try:
+                    worker_ok = await self.process_batch(client, message_ids_batch)
+                    if not worker_ok: # Hit FloodWait
+                        self.cooldown_workers[client] = time.time() + 10 # 10s default, process_batch sets longer
+                except Exception as e:
+                    logger.error(f"Worker {client.me.first_name} had unexpected failure: {e}. Re-queuing batch (duplicates possible).", exc_info=True)
+                    # This is the trade-off: to prevent skips, we must risk duplicates.
+                    # We must "un-claim" the batch by decrementing the fetched count.
+                    await db.tasks.update_one({'_id': self.task_id}, {'$inc': {'fetched': -len(message_ids_batch)}})
+                    self.cooldown_workers[client] = time.time() + 10 # 10s cooldown
+            else:
+                # No batch, wait a moment
+                await asyncio.sleep(0.5)
 
     async def process_batch(self, client, message_ids):
         """
         Processes a batch. Returns True if worker is healthy, False if FloodWaited.
-        Updates DB with stats.
+        This function NO LONGER updates 'fetched', but DOES update 'total_files' and 'failed'.
         """
         try:
             messages = await client.get_messages(self.task_data['from_chat_id'], message_ids)
         except Exception as e:
             logger.error(f"Failed to get_messages for batch {message_ids[0]}-{message_ids[-1]}. Error: {e}. Re-queuing.")
-            self.job_queue.appendleft(message_ids) # Re-queue the whole batch
-            self.cooldown_workers[client] = asyncio.get_running_loop().time() + 10 # Put worker on cooldown
+            # We "un-claim" this batch so another worker can try it.
+            await db.tasks.update_one(
+                {'_id': self.task_id},
+                {'$inc': {'fetched': -len(message_ids)}}
+            )
             return False # Worker is not healthy
 
-        batch_fetched = 0
         batch_forwarded = 0
         batch_failed = 0
-
+        re_queue_remaining = False
+        
         for i, message in enumerate(messages):
             if self.is_cancelled:
-                remaining_ids = [msg.id for msg in messages[i:] if msg] # Filter out None
-                if remaining_ids: self.job_queue.appendleft(remaining_ids)
-                
-                # Update DB with what we did process
-                if batch_fetched > 0:
-                    await db.tasks.update_one(
-                        {'_id': self.task_id},
-                        {'$inc': {'fetched': batch_fetched, 'total_files': batch_forwarded, 'failed': batch_failed}}
-                    )
-                return True # Worker is fine, just task is cancelled
+                # If cancelled, we must un-claim the remaining messages
+                remaining_count = len(messages[i:])
+                if remaining_count > 0:
+                    await db.tasks.update_one({'_id': self.task_id}, {'$inc': {'fetched': -remaining_count}})
+                re_queue_remaining = True
+                break
 
-            # message can be None if it was deleted
             if not message:
-                batch_fetched += 1
                 batch_failed += 1
                 continue
 
-            batch_fetched += 1
             if should_skip(message, self.configs):
                 continue
+                
             try:
                 if self.configs.get('forward_tag', False):
                     await client.forward_messages(chat_id=self.task_data['to_chat_id'], from_chat_id=self.task_data['from_chat_id'], message_ids=[message.id])
@@ -211,41 +229,28 @@ class WorkerManager:
                 batch_forwarded += 1
                 if self.delay > 0: await asyncio.sleep(self.delay)
             except FloodWait as e:
-                logger.warning(f"Worker {client.me.first_name} hit FloodWait on msg {message.id}. Re-queuing remainder.")
+                logger.warning(f"Worker {client.me.first_name} hit FloodWait. Re-queuing remainder.")
                 cooldown_duration = e.value + 5
-                self.cooldown_workers[client] = asyncio.get_running_loop().time() + cooldown_duration
+                self.cooldown_workers[client] = time.time() + cooldown_duration
                 
-                # Re-queue remaining messages
-                remaining_ids = [msg.id for msg in messages[i:] if msg]
-                if remaining_ids: self.job_queue.appendleft(remaining_ids)
-                
-                # Update DB with stats for messages *before* the floodwait
-                # We processed (batch_fetched - 1) messages
-                if batch_fetched > 0:
-                     await db.tasks.update_one(
-                        {'_id': self.task_id},
-                        {'$inc': {'fetched': batch_fetched - 1, 'total_files': batch_forwarded, 'failed': batch_failed}}
-                    )
-                return False # Worker is now on cooldown
+                # Un-claim remaining messages
+                remaining_count = len(messages[i:])
+                if remaining_count > 0:
+                    await db.tasks.update_one({'_id': self.task_id}, {'$inc': {'fetched': -remaining_count}})
+                re_queue_remaining = True
+                break # Stop processing this batch
             except Exception as e:
                 logger.error(f"Failed to process message {message.id}. Error: {e}")
                 batch_failed += 1
 
-        # Batch completed, update DB
-        if batch_fetched > 0:
+        # Batch completed (or interrupted), update DB
+        if batch_forwarded > 0 or batch_failed > 0:
             await db.tasks.update_one(
                 {'_id': self.task_id},
-                {'$inc': {'fetched': batch_fetched, 'total_files': batch_forwarded, 'failed': batch_failed}}
+                {'$inc': {'total_files': batch_forwarded, 'failed': batch_failed}}
             )
-        return True # Worker is healthy
-
-    def check_cooldowns(self):
-        now = asyncio.get_running_loop().time()
-        ready_workers = [w for w, end in self.cooldown_workers.items() if now >= end]
-        for worker in ready_workers:
-            logger.info(f"Worker {worker.me.first_name} cooldown finished.")
-            self.clients.append(worker)
-            del self.cooldown_workers[worker]
+            
+        return not re_queue_remaining # Return True if healthy, False if FloodWait/Cancelled
 
     def cancel(self):
         self.is_cancelled = True
@@ -259,32 +264,20 @@ async def resilient_start_clone(config):
     except Exception as e:
         return None, str(e)
 
-# --- FIX 2: Modified robust_access_check ---
 async def robust_access_check(client, chat_id):
     """
     A more robust check to ensure a client can access a chat and its history.
     This helps "warm up" the client's session cache.
     """
     try:
-        # The key change is here: we get the full chat object
         chat = await client.get_chat(chat_id)
-        
-        # NEW CHECK: Only test history for USERBOTS (not bots)
-        # Bots cannot use get_chat_history in all cases, causing BotMethodInvalid
         if not client.me.is_bot:
             async for _ in client.get_chat_history(chat.id, limit=1):
                 pass
-        else:
-            # For bots, just getting the chat is a good enough check.
-            # We can't reliably check get_chat_history.
-            pass
-        
         return True, None
     except Exception as e:
-        # Add more detailed logging to see the exact error
         logger.error(f"Robust access check failed for chat {chat_id}: {e}", exc_info=True)
         return False, type(e).__name__
-# --- END FIX 2 ---
 
 
 @Client.on_callback_query(filters.regex(r'^start_public_'))
@@ -339,6 +332,7 @@ async def pub_(bot, cb: CallbackQuery):
         
         start_id, end_id = min(session['start_id'], session['end_id']), max(session['start_id'], session['end_id'])
         
+        # --- MODIFIED: REMOVED last_processed_id ---
         task_doc = {
             '_id': task_id,
             'user_id': user_id,
@@ -347,8 +341,7 @@ async def pub_(bot, cb: CallbackQuery):
             'start_id': start_id,
             'end_id': end_id,
             'total_messages': (end_id - start_id) + 1,
-            'last_processed_id': start_id - 1, # Start just before the first message
-            'fetched': 0,
+            'fetched': 0, # This is now the main counter
             'total_files': 0,
             'failed': 0,
             'status': 'running', # 'running', 'paused', 'completed', 'cancelled', 'failed'
@@ -356,6 +349,7 @@ async def pub_(bot, cb: CallbackQuery):
             'configs': user_configs,
             'error': None
         }
+        # --- END MODIFICATION ---
         
         try:
             await db.tasks.insert_one(task_doc)
@@ -368,14 +362,11 @@ async def pub_(bot, cb: CallbackQuery):
         
         await m.edit(f"`Step 4/4: Deploying {len(valid_operators)} valid worker(s)...`")
         
-        # Pass the task_doc
         text, buttons = progress_message_content(task_doc)
         await m.edit(text, reply_markup=buttons)
 
-        # Pass task_id
         reporter_task = asyncio.create_task(edit_progress(m, task_id))
         
-        # Pass task_doc
         manager = WorkerManager(valid_operators, task_doc, user_configs)
         
         cancel_task = asyncio.create_task(cancel_checker(task_id, manager))
@@ -384,12 +375,11 @@ async def pub_(bot, cb: CallbackQuery):
     except Exception as e:
         logger.error(f"Task {task_id} failed: {e}", exc_info=True)
         await m.edit(f"**TASK FAILED**\n\n**Reason:** `{e}`")
-        await db.tasks.update_one({'_id': task_id}, {'$set': {'status': 'failed', 'error': str(e)}}) # Mark as failed in DB
+        await db.tasks.update_one({'_id': task_id}, {'$set': {'status': 'failed', 'error': str(e)}})
     finally:
         if 'reporter_task' in locals(): reporter_task.cancel()
         if 'cancel_task' in locals(): cancel_task.cancel()
         
-        # Update progress one last time
         await edit_progress(m, task_id, done=True)
         
         logger.info(f"Cleaning up resources for task {task_id}...")
@@ -416,7 +406,6 @@ async def cancel_checker(task_id, manager):
 async def status_popup_cb(bot, cb):
     task_id = cb.data.split("_")[-1]
     
-    # Fetch from DB
     task_doc = await db.tasks.find_one({'_id': task_id})
     if not task_doc:
         return await cb.answer("This task has expired or is invalid.", show_alert=True)
@@ -431,7 +420,7 @@ async def cancel_task_cb(bot, cb):
     await cb.answer("Cancelling task... Please wait.", show_alert=True)
     try: 
         await cb.message.edit_reply_markup(None)
-        await db.tasks.update_one({'_id': task_id, 'status': 'running'}, {'$set': {'status': 'cancelled'}})
+        # The manager will update the DB status
     except MessageNotModified: pass
     except Exception as e:
         logger.warning(f"Error during task cancel CB: {e}")
@@ -458,7 +447,6 @@ async def start(client, message):
 async def restart(client, message):
     msg = await message.reply_text("<i>Restarting...</i>")
     await asyncio.sleep(2)
-    # Don't edit, the bot will be gone
     os.execl(sys.executable, sys.executable, *sys.argv)
 
 def parse_message_input(message):
@@ -547,14 +535,12 @@ async def universal_message_handler(bot: Client, message: Message):
     user_id = message.from_user.id
     state = temp.USER_STATES.get(user_id)
     if not state: 
-        # Check for forwarded messages that are not part of a state
         if message.forward_from_chat and state.get("state") not in ['diag_awaiting_source', 'awaiting_channel_forward']:
-             return # Ignore random forwarded messages
-        # Allow other messages to pass through (e.g., text for caption/button)
+             return 
         if not (message.text and message.text.startswith('/')):
-             pass # Will be handled by state check below
+             pass 
         else:
-             return # Unknown command, do nothing
+             return 
 
     if message.text and message.text.lower() == "/cancel":
         prompt_id = state.get("prompt_message_id")
@@ -567,7 +553,6 @@ async def universal_message_handler(bot: Client, message: Message):
         await bot.send_message(user_id, "Cancelled.")
         return
 
-    # Re-check state after cancel
     state = temp.USER_STATES.get(user_id)
     if not state:
         return
@@ -593,14 +578,12 @@ async def universal_message_handler(bot: Client, message: Message):
             
         from_title = "Private Chat"
         try:
-            # Use the first available bot/userbot to get title
             async with CLIENT.client(bots[0]) as temp_client:
                 await temp_client.start()
                 from_title = (await temp_client.get_chat(from_chat)).title
         except Exception as e:
             logger.warning(f"Could not get chat title for {from_chat} using first operator: {e}")
             try:
-                 # Try with main bot as fallback
                  from_title = (await bot.get_chat(from_chat)).title
             except Exception as e2:
                  logger.error(f"Could not get chat title for {from_chat} using main bot: {e2}")
@@ -622,25 +605,17 @@ async def universal_message_handler(bot: Client, message: Message):
         except ValueError: await message.reply_text("Not a valid ID.")
         return
         
-    # --- FIX 1: Handle /diagnose state ---
     elif state_type == 'diag_awaiting_source':
-        # This state is handled by 'diagnose.py'
-        # We just check for invalid (non-forwarded) messages here.
         if not message.forward_from_chat:
             await bot.send_message(user_id, "Invalid input. Please forward a message from the source chat.")
-            # Re-set prompt
             prompt = await bot.send_message(user_id, "Please forward a message from the source chat.")
             state['prompt_message_id'] = prompt.id
-            return # Return ONLY if invalid input.
+            return 
         
-        # If it IS a forwarded message, we do NOT return,
-        # allowing it to fall through to the handler in diagnose.py
         pass
-    # --- END FIX 1 ---
 
     if not state.get("is_settings"): return
     
-    # We are in settings, pop state
     temp.USER_STATES.pop(user_id, None)
     sent_message = await message.reply_text("`Processing...`")
 
