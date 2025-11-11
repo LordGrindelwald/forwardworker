@@ -58,201 +58,151 @@ def get_custom_caption(msg, caption_template):
 
     return caption_template.format(filename="", size="", caption=original_caption)
 
-class WorkerManager:
-    def __init__(self, operator_clients, task_doc, configs):
-        self.clients = deque(operator_clients)
-        self.task_id = task_doc['_id']
-        self.task_data = task_doc  # This is our initial cache
-        self.configs = configs
-        self.delay = configs.get('forward_delay', 0.5)
-        self.cooldown_workers = {}
-        self.is_cancelled = False
-        self.task_is_done = False # Flag to stop new work
-        # This lock ensures only one worker is claiming from the DB at a time
-        self.db_lock = asyncio.Lock() 
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# NEW PARTITION WORKER (REPLACES WorkerManager)
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-    async def claim_next_batch(self):
-        """
-        Atomically claims the next batch from the database.
-        This is the *only* function that touches the 'fetched' count for claiming.
-        Returns (message_ids_batch, is_done)
-        """
-        async with self.db_lock:
-            if self.task_is_done:
-                return None, True
-
-            # Get the *current* state from the DB
-            task_doc = await db.tasks.find_one(
-                {'_id': self.task_id, 'status': 'running'}
-            )
-
-            if not task_doc:
-                self.task_is_done = True
-                return None, True
-
-            current_fetched = task_doc['fetched']
-            total_messages = task_doc['total_messages']
-            start_id = task_doc['start_id']
-            end_id = task_doc['end_id']
-
-            if current_fetched >= total_messages:
-                self.task_is_done = True
-                return None, True
-
-            # Calculate the next batch
-            messages_in_batch = min(BATCH_SIZE, total_messages - current_fetched)
-            new_fetched_count = current_fetched + messages_in_batch
-            
-            # Atomically update the fetched count
-            await db.tasks.update_one(
-                {'_id': self.task_id},
-                {'$set': {'fetched': new_fetched_count}}
-            )
-
-            # Calculate the message IDs for this claimed batch
-            batch_start_msg_id = start_id + current_fetched
-            batch_end_msg_id = start_id + new_fetched_count - 1
-            
-            message_ids_batch = list(range(batch_start_msg_id, batch_end_msg_id + 1))
-            
-            logger.info(f"Task {self.task_id}: Claimed batch {batch_start_msg_id}-{batch_end_msg_id}")
-            return message_ids_batch, False
-
-    async def start(self):
-        """
-        Starts worker tasks that pull from the atomic claim function.
-        """
-        logger.info(f"WorkerManager started for task {self.task_id} with {len(self.clients)} workers.")
+async def run_partition_worker(sub_task_doc):
+    """
+    Runs a single, persistent partition (a sub-task) for a specific operator.
+    This function is designed to be resumed.
+    """
+    sub_task_id = sub_task_doc['_id']
+    parent_task_id = sub_task_doc['parent_task_id']
+    operator_config = sub_task_doc['operator_config']
+    operator_id = operator_config['id']
+    from_chat_id = sub_task_doc['from_chat_id']
+    to_chat_id = sub_task_doc['to_chat_id']
+    
+    # Get the static configs from the parent task
+    parent_task = await db.tasks.find_one({'_id': parent_task_id})
+    if not parent_task:
+        logger.error(f"Sub-task {sub_task_id} has no parent {parent_task_id}. Aborting.")
+        return
         
-        # Create a worker task for each available client
-        worker_tasks = []
-        for client in self.clients:
-            worker_tasks.append(
-                asyncio.create_task(self.worker_loop(client))
-            )
+    configs = parent_task['configs']
+    delay = configs.get('forward_delay', 0.5)
+    
+    # Pre-parse caption and buttons (as we can't get the message object)
+    raw_caption = configs.get('caption')
+    raw_buttons = parse_buttons(configs.get('button'))
+
+    logger.info(f"Worker {operator_id} starting for sub-task {sub_task_id} (Parent: {parent_task_id})")
+
+    operator_client = None
+    try:
+        # 1. Start the client
+        operator_client, error = await resilient_start_clone(operator_config)
+        if not operator_client:
+            raise Exception(f"Failed to start operator {operator_id}: {error}")
         
-        # Wait for all worker tasks to complete
-        await asyncio.gather(*worker_tasks)
-
-        logger.info(f"WorkerManager for task {self.task_id} stopping.")
+        # 2. Get state and loop
+        current_id = sub_task_doc['current_id']
+        end_id = sub_task_doc['end_id']
         
-        if self.is_cancelled:
-            await db.tasks.update_one({'_id': self.task_id}, {'$set': {'status': 'cancelled'}})
-        else:
-             # Final check
-             final_doc = await db.tasks.find_one({'_id': self.task_id})
-             if final_doc and final_doc['fetched'] >= final_doc['total_messages']:
-                await db.tasks.update_one({'_id': self.task_id}, {'$set': {'status': 'completed'}})
+        await db.sub_tasks.update_one({'_id': sub_task_id}, {'$set': {'status': 'running'}})
 
-    async def worker_loop(self, client):
-        """
-        A single worker's processing loop.
-        It will continuously claim and process batches until the task is done.
-        """
-        while not self.is_cancelled and not self.task_is_done:
-            # Check if this worker is on cooldown
-            if client in self.cooldown_workers:
-                if time.time() < self.cooldown_workers[client]:
-                    await asyncio.sleep(1) # Wait if on cooldown
-                    continue
-                else:
-                    logger.info(f"Worker {client.me.first_name} cooldown finished.")
-                    del self.cooldown_workers[client] # Cooldown over
+        for message_id in range(current_id + 1, end_id + 1):
+            
+            # Check for cancellation
+            if temp.CANCEL.get(parent_task_id):
+                logger.info(f"Cancel signal received for {parent_task_id}. Worker {operator_id} stopping.")
+                await db.sub_tasks.update_one({'_id': sub_task_id}, {'$set': {'status': 'cancelled'}})
+                break # Exit the loop
 
-            # Claim the next available batch
-            message_ids_batch, is_done = await self.claim_next_batch()
-
-            if is_done:
-                break # No more work
-
-            if message_ids_batch:
+            try_process = True
+            while try_process:
                 try:
-                    worker_ok = await self.process_batch(client, message_ids_batch)
-                    if not worker_ok: # Hit FloodWait
-                        self.cooldown_workers[client] = time.time() + 10 # 10s default, process_batch sets longer
-                except Exception as e:
-                    logger.error(f"Worker {client.me.first_name} had unexpected failure: {e}. Re-queuing batch (duplicates possible).", exc_info=True)
-                    # This is the trade-off: to prevent skips, we must risk duplicates.
-                    # We must "un-claim" the batch by decrementing the fetched count.
-                    await db.tasks.update_one({'_id': self.task_id}, {'$inc': {'fetched': -len(message_ids_batch)}})
-                    self.cooldown_workers[client] = time.time() + 10 # 10s cooldown
-            else:
-                # No batch, wait a moment
-                await asyncio.sleep(0.5)
-
-    async def process_batch(self, client, message_ids):
-        """
-        Processes a batch. Returns True if worker is healthy, False if FloodWaited.
-        This function NO LONGER updates 'fetched', but DOES update 'total_files' and 'failed'.
-        """
-        try:
-            messages = await client.get_messages(self.task_data['from_chat_id'], message_ids)
-        except Exception as e:
-            logger.error(f"Failed to get_messages for batch {message_ids[0]}-{message_ids[-1]}. Error: {e}. Re-queuing.")
-            # We "un-claim" this batch so another worker can try it.
-            await db.tasks.update_one(
-                {'_id': self.task_id},
-                {'$inc': {'fetched': -len(message_ids)}}
-            )
-            return False # Worker is not healthy
-
-        batch_forwarded = 0
-        batch_failed = 0
-        re_queue_remaining = False
-        
-        for i, message in enumerate(messages):
-            if self.is_cancelled:
-                # If cancelled, we must un-claim the remaining messages
-                remaining_count = len(messages[i:])
-                if remaining_count > 0:
-                    await db.tasks.update_one({'_id': self.task_id}, {'$inc': {'fetched': -remaining_count}})
-                re_queue_remaining = True
-                break
-
-            if not message:
-                batch_failed += 1
-                continue
-
-            if should_skip(message, self.configs):
-                continue
-                
-            try:
-                if self.configs.get('forward_tag', False):
-                    await client.forward_messages(chat_id=self.task_data['to_chat_id'], from_chat_id=self.task_data['from_chat_id'], message_ids=[message.id])
-                else:
-                    await client.copy_message(
-                        chat_id=self.task_data['to_chat_id'], from_chat_id=self.task_data['from_chat_id'], message_id=message.id,
-                        caption=get_custom_caption(message, self.configs.get('caption')),
-                        reply_markup=parse_buttons(self.configs.get('button'))
+                    # 3. Process the message (bot-compatible "try-copy")
+                    if configs.get('forward_tag', False):
+                        await operator_client.forward_messages(
+                            chat_id=to_chat_id, 
+                            from_chat_id=from_chat_id, 
+                            message_ids=[message_id]
+                        )
+                    else:
+                        await operator_client.copy_message(
+                            chat_id=to_chat_id, 
+                            from_chat_id=from_chat_id, 
+                            message_id=message_id,
+                            caption=raw_caption,
+                            reply_markup=raw_buttons
+                        )
+                    
+                    # 4.A. On Success: Update DB state
+                    await db.sub_tasks.update_one(
+                        {'_id': sub_task_id},
+                        {'$set': {'current_id': message_id}, '$inc': {'total_files': 1}}
                     )
-                batch_forwarded += 1
-                if self.delay > 0: await asyncio.sleep(self.delay)
-            except FloodWait as e:
-                logger.warning(f"Worker {client.me.first_name} hit FloodWait. Re-queuing remainder.")
-                cooldown_duration = e.value + 5
-                self.cooldown_workers[client] = time.time() + cooldown_duration
-                
-                # Un-claim remaining messages
-                remaining_count = len(messages[i:])
-                if remaining_count > 0:
-                    await db.tasks.update_one({'_id': self.task_id}, {'$inc': {'fetched': -remaining_count}})
-                re_queue_remaining = True
-                break # Stop processing this batch
-            except Exception as e:
-                logger.error(f"Failed to process message {message.id}. Error: {e}")
-                batch_failed += 1
+                    # Aggregate into parent task
+                    await db.tasks.update_one(
+                        {'_id': parent_task_id},
+                        {'$inc': {'fetched': 1, 'total_files': 1}}
+                    )
+                    
+                    try_process = False # Success, move to next message_id
+                    if delay > 0: await asyncio.sleep(delay)
 
-        # Batch completed (or interrupted), update DB
-        if batch_forwarded > 0 or batch_failed > 0:
-            await db.tasks.update_one(
-                {'_id': self.task_id},
-                {'$inc': {'total_files': batch_forwarded, 'failed': batch_failed}}
-            )
+                except FloodWait as e:
+                    logger.warning(f"Worker {operator_id} hit FloodWait. Sleeping for {e.value}s.")
+                    await db.sub_tasks.update_one({'_id': sub_task_id}, {'$set': {'status': 'paused'}})
+                    await asyncio.sleep(e.value + 5) # Wait
+                    await db.sub_tasks.update_one({'_id': sub_task_id}, {'$set': {'status': 'running'}})
+                    try_process = True # Stay on the same message_id
+
+                except Exception as e:
+                    # 4.B. On Failure (deleted, etc): Update DB state
+                    logger.warning(f"Worker {operator_id} failed to copy {message_id}: {type(e).__name__}")
+                    await db.sub_tasks.update_one(
+                        {'_id': sub_task_id},
+                        {'$set': {'current_id': message_id}, '$inc': {'failed': 1}}
+                    )
+                    # Aggregate into parent task
+                    await db.tasks.update_one(
+                        {'_id': parent_task_id},
+                        {'$inc': {'fetched': 1, 'failed': 1}}
+                    )
+                    try_process = False # Failed, move to next message_id
+        
+        else:
+            # Loop finished without breaking
+            logger.info(f"Worker {operator_id} completed sub-task {sub_task_id}.")
+            await db.sub_tasks.update_one({'_id': sub_task_id}, {'$set': {'status': 'completed'}})
+
+    except Exception as e:
+        logger.error(f"Worker {operator_id} failed sub-task {sub_task_id}: {e}", exc_info=True)
+        await db.sub_tasks.update_one({'_id': sub_task_id}, {'$set': {'status': 'failed', 'error': str(e)}})
+    
+    finally:
+        # 5. Stop the client
+        if operator_client and operator_client.is_connected:
+            await operator_client.stop()
+            logger.info(f"Worker {operator_id} client stopped.")
+        
+        # 6. Check if all sub-tasks are done
+        parent_task_id = sub_task_doc['parent_task_id']
+        if parent_task_id:
+            all_sub_tasks = await db.sub_tasks.find(
+                {'parent_task_id': parent_task_id}
+            ).to_list(None)
             
-        return not re_queue_remaining # Return True if healthy, False if FloodWait/Cancelled
+            if all(sub['status'] in ['completed', 'cancelled', 'failed'] for sub in all_sub_tasks):
+                logger.info(f"All sub-tasks for parent {parent_task_id} are finished.")
+                
+                final_status = 'completed'
+                if any(sub['status'] == 'failed' for sub in all_sub_tasks):
+                    final_status = 'failed'
+                elif all(sub['status'] == 'cancelled' for sub in all_sub_tasks):
+                    final_status = 'cancelled'
+                    
+                await db.tasks.update_one(
+                    {'_id': parent_task_id},
+                    {'$set': {'status': final_status}}
+                )
 
-    def cancel(self):
-        self.is_cancelled = True
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# END NEW PARTITION WORKER
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 async def resilient_start_clone(config):
     try:
@@ -289,35 +239,38 @@ async def pub_(bot, cb: CallbackQuery):
     await cb.answer()
     m = await cb.message.edit("`Initializing...`")
     
-    all_operator_clients = []
-    task_id = generate_short_id() # This is our new persistent task_id
-    valid_operators = [] # Define here for finally block
+    task_id = generate_short_id() # This is our new persistent PARENT task_id
     
     try:
         user_configs = await db.get_configs(user_id)
         operator_configs = await db.get_bots(user_id)
         if not operator_configs: raise ValueError("No Operator Bots/Userbots found in your settings.")
         
-        await m.edit(f"`Step 1/4: Starting {len(operator_configs)} operator(s)...`")
-        results = await asyncio.gather(*[resilient_start_clone(c) for c in operator_configs])
+        await m.edit(f"`Step 1/4: Starting {len(operator_configs)} operator(s) for access check...`")
         
+        # --- We still check access with all operators ---
+        results = await asyncio.gather(*[resilient_start_clone(c) for c in operator_configs])
         all_operator_clients = [client for client, error in results if client]
         
         await m.edit(f"`Step 2/4: Warming up sessions and verifying access...`")
         
         failed_operator_details = []
-
-        for client in all_operator_clients:
-            # Use the bot-safe robust_access_check
+        valid_operators = [] # This will be a list of CONFIGS, not clients
+        
+        for i, client in enumerate(all_operator_clients):
             source_ok, source_err = await robust_access_check(client, session['from_chat_id'])
             target_ok, target_err = await robust_access_check(client, session['to_chat_id'])
 
             if source_ok and target_ok:
-                valid_operators.append(client)
+                valid_operators.append(operator_configs[i]) # Add the CONFIG
             else:
                 err_detail = source_err if not source_ok else target_err
                 logger.warning(f"Operator {client.me.first_name} failed access check: {err_detail}")
                 failed_operator_details.append(f"`{client.me.first_name}` ({err_detail})")
+            
+            # Stop the client after checking
+            if client.is_connected:
+                await client.stop()
         
         if failed_operator_details:
             details_str = "\n- ".join(failed_operator_details)
@@ -325,10 +278,12 @@ async def pub_(bot, cb: CallbackQuery):
 
         if not valid_operators:
             raise ValueError("No operators could access both the source and target chats. Please check their permissions and memberships.")
+        # --- End access check ---
 
         await m.edit("`Step 3/4: Creating persistent task in database...`")
         
         start_id, end_id = min(session['start_id'], session['end_id']), max(session['start_id'], session['end_id'])
+        total_messages = (end_id - start_id) + 1
         
         task_doc = {
             '_id': task_id,
@@ -337,13 +292,14 @@ async def pub_(bot, cb: CallbackQuery):
             'to_chat_id': session['to_chat_id'],
             'start_id': start_id,
             'end_id': end_id,
-            'total_messages': (end_id - start_id) + 1,
-            'fetched': 0, # This is now the main counter
+            'total_messages': total_messages,
+            'fetched': 0,
             'total_files': 0,
             'failed': 0,
-            'status': 'running', # 'running', 'paused', 'completed', 'cancelled', 'failed'
+            'skipped': 0, # Still here for the UI
+            'status': 'running',
             'start_time': time.time(),
-            'configs': user_configs,
+            'configs': user_configs, # Store configs in the parent task
             'error': None
         }
         
@@ -356,17 +312,53 @@ async def pub_(bot, cb: CallbackQuery):
         temp.ACTIVE_TASKS.setdefault(user_id, {})[task_id] = {"process": m, "start_time": task_doc['start_time']}
         temp.lock[user_id] = True
         
-        await m.edit(f"`Step 4/4: Deploying {len(valid_operators)} valid worker(s)...`")
+        await m.edit(f"`Step 4/4: Partitioning {total_messages} messages for {len(valid_operators)} worker(s)...`")
         
+        # --- NEW PARTITION LOGIC ---
+        num_operators = len(valid_operators)
+        messages_per_op = total_messages // num_operators
+        remainder = total_messages % num_operators
+        
+        current_msg_id = start_id
+        
+        for i, op_config in enumerate(valid_operators):
+            part_size = messages_per_op
+            if i < remainder:
+                part_size += 1 # Distribute the remainder
+                
+            if part_size == 0:
+                continue # Skip operator if no messages to assign
+
+            part_start_id = current_msg_id
+            part_end_id = current_msg_id + part_size - 1
+            
+            sub_task_doc = {
+                '_id': generate_short_id(12), # Longer ID for sub-tasks
+                'parent_task_id': task_id,
+                'user_id': user_id,
+                'operator_config': op_config,
+                'from_chat_id': session['from_chat_id'],
+                'to_chat_id': session['to_chat_id'],
+                'start_id': part_start_id,
+                'end_id': part_end_id,
+                'current_id': part_start_id - 1, # Start *before* the first message
+                'total_files': 0,
+                'failed': 0,
+                'status': 'running',
+                'error': None
+            }
+            
+            await db.sub_tasks.insert_one(sub_task_doc)
+            asyncio.create_task(run_partition_worker(sub_task_doc))
+            
+            current_msg_id = part_end_id + 1
+        # --- END PARTITION LOGIC ---
+
         text, buttons = progress_message_content(task_doc)
         await m.edit(text, reply_markup=buttons)
 
+        # The reporter task just monitors the parent task, which is perfect.
         reporter_task = asyncio.create_task(edit_progress(m, task_id))
-        
-        manager = WorkerManager(valid_operators, task_doc, user_configs)
-        
-        cancel_task = asyncio.create_task(cancel_checker(task_id, manager))
-        await manager.start()
 
     except Exception as e:
         logger.error(f"Task {task_id} failed: {e}", exc_info=True)
@@ -374,15 +366,11 @@ async def pub_(bot, cb: CallbackQuery):
         await db.tasks.update_one({'_id': task_id}, {'$set': {'status': 'failed', 'error': str(e)}})
     finally:
         if 'reporter_task' in locals(): reporter_task.cancel()
-        if 'cancel_task' in locals(): cancel_task.cancel()
+        
+        # We no longer stop clients here, they stop themselves.
+        # We also don't manage a 'cancel_task'.
         
         await edit_progress(m, task_id, done=True)
-        
-        logger.info(f"Cleaning up resources for task {task_id}...")
-        
-        clients_to_stop = valid_operators
-        
-        await asyncio.gather(*[client.stop() for client in clients_to_stop if client.is_connected], return_exceptions=True)
         
         temp.FORWARD_SESSIONS.pop(frwd_id, None)
         if user_id in temp.ACTIVE_TASKS:
@@ -390,13 +378,6 @@ async def pub_(bot, cb: CallbackQuery):
         temp.CANCEL.pop(task_id, None)
         temp.lock.pop(user_id, None)
         logger.info(f"Cleanup complete for task {task_id}.")
-
-async def cancel_checker(task_id, manager):
-    while not manager.is_cancelled:
-        if temp.CANCEL.get(task_id):
-            manager.cancel()
-            break
-        await asyncio.sleep(1)
 
 @Client.on_callback_query(filters.regex(r'^fwrdstatus_'))
 async def status_popup_cb(bot, cb):
