@@ -71,7 +71,6 @@ class WorkerManager:
         # This lock ensures only one worker is claiming from the DB at a time
         self.db_lock = asyncio.Lock() 
 
-    # --- NEW: ATOMIC, RESUME-SAFE BATCH CLAIMING ---
     async def claim_next_batch(self):
         """
         Atomically claims the next batch from the database.
@@ -187,7 +186,6 @@ class WorkerManager:
         This function NO LONGER updates 'fetched', but DOES update 'total_files' and 'failed'.
         """
         try:
-            # This is the bot-safe method, as used in mistraldrin/fwd/fwd-DawnUltra/plugins/regix.py
             messages = await client.get_messages(self.task_data['from_chat_id'], message_ids)
         except Exception as e:
             logger.error(f"Failed to get_messages for batch {message_ids[0]}-{message_ids[-1]}. Error: {e}. Re-queuing.")
@@ -265,19 +263,16 @@ async def resilient_start_clone(config):
     except Exception as e:
         return None, str(e)
 
-# --- MODIFIED: This is the FIX for BotMethodInvalid ---
-# Removed the get_chat_history call entirely, as it's not bot-safe.
 async def robust_access_check(client, chat_id):
     """
     A bot-safe check to ensure a client can access a chat.
     """
     try:
         # Just checking get_chat is safe for bots and userbots.
+        # This works with INT IDs (-100123) and STRING usernames ("publicchannel")
         chat = await client.get_chat(chat_id)
-        # --- END FIX ---
         return True, None
     except Exception as e:
-        # Add more detailed logging to see the exact error
         logger.error(f"Robust access check failed for chat {chat_id}: {e}", exc_info=True)
         return False, type(e).__name__
 
@@ -313,7 +308,7 @@ async def pub_(bot, cb: CallbackQuery):
         failed_operator_details = []
 
         for client in all_operator_clients:
-            # Use the new bot-safe robust_access_check
+            # Use the bot-safe robust_access_check
             source_ok, source_err = await robust_access_check(client, session['from_chat_id'])
             target_ok, target_err = await robust_access_check(client, session['to_chat_id'])
 
@@ -450,15 +445,35 @@ async def restart(client, message):
     await asyncio.sleep(2)
     os.execl(sys.executable, sys.executable, *sys.argv)
 
+# --- THIS IS THE CORRECTED, ROBUST FUNCTION ---
+# Inspired by mistaldrin/fwd/fwd-DawnUltra/plugins/public.py
 def parse_message_input(message):
+    """Parses a forwarded message or a message link."""
+    if not message or (not message.text and not message.forward_date):
+        return None, None, "Invalid input. A message link or forwarded message is required."
+
     if message.text and not message.forward_date:
-        match = re.match(r"(https://)?t\.me/(c/)?(\d+|[a-zA-Z_0-9]+)/(\d+)", message.text.replace("?single", ""))
-        if match:
-            chat_id = f"-100{match.group(3)}" if match.group(3).isdigit() else match.group(3)
-            return chat_id, int(match.group(4)), None
+        # Regex from mistraldrin repo, adapted for lordgrindelwald capture groups
+        regex = re.compile(r"(https://)?t\.me/(c/)?(\d+|[a-zA-Z_0-9]+)/(\d+)")
+        match = regex.match(message.text.replace("?single", ""))
+        if not match: 
+            return None, None, 'Invalid Link.'
+        
+        chat_id_str, msg_id = match.group(3), int(match.group(4))
+        
+        # --- THIS IS THE FIX ---
+        # Correctly casts private channel IDs to INT
+        chat_id = int(("-100" + chat_id_str)) if chat_id_str.isnumeric() else chat_id_str
+        # --- END FIX ---
+        
+        return chat_id, msg_id, None
     elif message.forward_from_chat:
-        return message.forward_from_chat.id, message.forward_from_message_id, None
-    return None, None, "Invalid input. Send a message link or forward a message."
+        # More robust check from mistraldrin repo
+        msg_id, chat_id = message.forward_from_message_id, message.forward_from_chat.username or message.forward_from_chat.id
+        return chat_id, msg_id, None
+    else:
+        return None, None, "Invalid input. Please forward from a channel or provide a valid message link."
+# --- END CORRECTED FUNCTION ---
 
 @Client.on_message(filters.private & filters.command(["fwd", "forward"]))
 async def forward_command_handler(bot, message):
@@ -558,6 +573,7 @@ async def universal_message_handler(bot: Client, message: Message):
     state_type = state.get("state")
 
     if state_type == 'awaiting_source':
+        # Use the new, corrected parse_message_input function
         from_chat, end_id, error = parse_message_input(message)
         
         if error:
