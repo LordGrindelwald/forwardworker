@@ -15,7 +15,8 @@ class Database:
         self.bot = self.db.bots
         self.col = self.db.user
         self.chl = self.db.channels
-        self.tasks = self.db.tasks  # <-- ADDED FOR PERSISTENCE
+        self.tasks = self.db.tasks
+        self.sub_tasks = self.db.sub_tasks  # <-- ADDED FOR PARTITIONS
 
     async def add_user(self, id, name):
         await self.col.insert_one({'id': id, 'name': name, 'ban_status': {'is_banned': False, 'ban_reason': ""}})
