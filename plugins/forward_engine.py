@@ -259,6 +259,7 @@ async def resilient_start_clone(config):
     except Exception as e:
         return None, str(e)
 
+# --- FIX 2: Modified robust_access_check ---
 async def robust_access_check(client, chat_id):
     """
     A more robust check to ensure a client can access a chat and its history.
@@ -268,15 +269,22 @@ async def robust_access_check(client, chat_id):
         # The key change is here: we get the full chat object
         chat = await client.get_chat(chat_id)
         
-        # Then we use the object's ID for the history check.
-        # This ensures we are using the most up-to-date access hash.
-        async for _ in client.get_chat_history(chat.id, limit=1):
+        # NEW CHECK: Only test history for USERBOTS (not bots)
+        # Bots cannot use get_chat_history in all cases, causing BotMethodInvalid
+        if not client.me.is_bot:
+            async for _ in client.get_chat_history(chat.id, limit=1):
+                pass
+        else:
+            # For bots, just getting the chat is a good enough check.
+            # We can't reliably check get_chat_history.
             pass
+        
         return True, None
     except Exception as e:
         # Add more detailed logging to see the exact error
         logger.error(f"Robust access check failed for chat {chat_id}: {e}", exc_info=True)
         return False, type(e).__name__
+# --- END FIX 2 ---
 
 
 @Client.on_callback_query(filters.regex(r'^start_public_'))
@@ -614,16 +622,21 @@ async def universal_message_handler(bot: Client, message: Message):
         except ValueError: await message.reply_text("Not a valid ID.")
         return
         
-    # Handle diagnosis messages
+    # --- FIX 1: Handle /diagnose state ---
     elif state_type == 'diag_awaiting_source':
-         # This is handled by the 'on_message(filters.forwarded)' in diagnose.py
-         # We add a check here in case it's not a forwarded message
-         if not message.forward_from_chat:
-             await bot.send_message(user_id, "Invalid input. Please forward a message from the source chat.")
-             # Re-set prompt
-             prompt = await bot.send_message(user_id, Translation.FROM_MSG)
-             state['prompt_message_id'] = prompt.id
-         return # Let the correct handler in diagnose.py take over
+        # This state is handled by 'diagnose.py'
+        # We just check for invalid (non-forwarded) messages here.
+        if not message.forward_from_chat:
+            await bot.send_message(user_id, "Invalid input. Please forward a message from the source chat.")
+            # Re-set prompt
+            prompt = await bot.send_message(user_id, "Please forward a message from the source chat.")
+            state['prompt_message_id'] = prompt.id
+            return # Return ONLY if invalid input.
+        
+        # If it IS a forwarded message, we do NOT return,
+        # allowing it to fall through to the handler in diagnose.py
+        pass
+    # --- END FIX 1 ---
 
     if not state.get("is_settings"): return
     
