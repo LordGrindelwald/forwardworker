@@ -5,8 +5,6 @@ import logging
 import logging.config
 from config import Config, temp
 from database import db
-from aiohttp import web
-from plugins import web_server
 from pyrogram import Client, __version__, idle
 from pyrogram.raw.all import layer 
 from pyrogram.enums import ParseMode
@@ -52,13 +50,6 @@ class Bot(Client):
         # --- ADD AUTO-RESTART LOGIC HERE ---
         await self.resume_running_tasks()
         # ------------------------------------
-
-        # Start the web server
-        app = web.AppRunner(await web_server())
-        await app.setup()
-        bind_address = "0.0.0.0"
-        await web.TCPSite(app, bind_address, PORT).start()
-        
         await idle()
 
     async def stop(self, *args):
