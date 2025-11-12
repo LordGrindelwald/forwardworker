@@ -1,6 +1,6 @@
 import time
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from config import temp
 from database import db
 from .utils import get_readable_time, progress_message_content
@@ -69,3 +69,40 @@ async def forward_delay(client: Client, message: Message):
         await message.reply_text("Invalid input. Please provide a number for the delay.")
     except Exception as e:
         await message.reply_text(f"An error occurred: {e}")
+
+@Client.on_callback_query(filters.regex(r'^show_tasks$'))
+async def show_tasks_callback(client, query: CallbackQuery):
+    """
+    Handles the 'Active Tasks' button from the help menu.
+    """
+    user_id = query.from_user.id
+    
+    # We check the DB for any running tasks for this user
+    active_tasks_docs = await db.tasks.find({
+        'user_id': user_id, 
+        'status': 'running'
+    }).to_list(length=10)
+    
+    if not active_tasks_docs:
+        await query.answer("You have no active tasks.", show_alert=True)
+        return
+    
+    await query.answer("Sending active task(s)...")
+    
+    # Reply to the *original message* (the /start photo)
+    for task_doc in active_tasks_docs:
+        task_id = task_doc['_id']
+        
+        live_task_info = temp.ACTIVE_TASKS.get(user_id, {}).get(task_id)
+        
+        text, buttons = progress_message_content(task_doc, done=False)
+        
+        reply_text = f"**Active Task:** `{task_id}`\n\n{text}"
+        
+        if not live_task_info:
+            reply_text = f"**(Resumed) {reply_text}"
+        
+        await query.message.reply_text(
+            reply_text,
+            reply_markup=buttons
+        )
