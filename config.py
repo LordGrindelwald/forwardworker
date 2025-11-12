@@ -9,6 +9,8 @@ class Config:
     PORT = os.environ.get("PORT", "8080")
     DB_NAME = os.environ.get("DB_NAME", "cluster0")
     OWNER_ID = [int(id) for id in os.environ.get("OWNER_ID", '').split()]
+    # --- ADDED THIS LINE ---
+    APP_URL = os.environ.get("APP_URL")
 
 
 class temp(object): 
