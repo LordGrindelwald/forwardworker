@@ -315,6 +315,7 @@ async def pub_(bot, cb: CallbackQuery):
         await m.edit(f"`Step 4/4: Partitioning {total_messages} messages for {len(valid_operators)} worker(s)...`")
         
         # --- NEW PARTITION LOGIC ---
+        worker_tasks = [] # <-- BUGFIX: Create list to hold tasks
         num_operators = len(valid_operators)
         messages_per_op = total_messages // num_operators
         remainder = total_messages % num_operators
@@ -349,7 +350,8 @@ async def pub_(bot, cb: CallbackQuery):
             }
             
             await db.sub_tasks.insert_one(sub_task_doc)
-            asyncio.create_task(run_partition_worker(sub_task_doc))
+            # BUGFIX: Add task to list instead of just creating it
+            worker_tasks.append(asyncio.create_task(run_partition_worker(sub_task_doc)))
             
             current_msg_id = part_end_id + 1
         # --- END PARTITION LOGIC ---
@@ -359,6 +361,11 @@ async def pub_(bot, cb: CallbackQuery):
 
         # The reporter task just monitors the parent task, which is perfect.
         reporter_task = asyncio.create_task(edit_progress(m, task_id))
+        
+        # --- BUGFIX: Wait for all workers AND the reporter to finish ---
+        all_running_tasks = worker_tasks + [reporter_task]
+        await asyncio.gather(*all_running_tasks, return_exceptions=True)
+        # --- END BUGFIX ---
 
     except Exception as e:
         logger.error(f"Task {task_id} failed: {e}", exc_info=True)
@@ -662,7 +669,11 @@ async def back_to_start(bot, query):
 async def helpcb(bot, query):
     await query.message.edit_caption(
         caption=Translation.HELP_TXT,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Settings', callback_data='settings#main'), InlineKeyboardButton('« Back', callback_data='back')]])
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('Settings', callback_data='settings#main'),
+             InlineKeyboardButton('Active Tasks', callback_data='show_tasks')], # <-- ADDED BUTTON
+            [InlineKeyboardButton('« Back', callback_data='back')]
+        ])
     )
 
 @Client.on_callback_query(filters.regex(r'^about'))
