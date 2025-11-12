@@ -3,8 +3,11 @@
 import asyncio
 import logging 
 import logging.config
+import aiohttp  # <-- ADDED IMPORT
 from config import Config, temp
 from database import db
+from aiohttp import web
+from plugins import web_server
 from pyrogram import Client, __version__, idle
 from pyrogram.raw.all import layer 
 from pyrogram.enums import ParseMode
@@ -20,6 +23,8 @@ logging.getLogger().setLevel(logging.INFO)
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
 PORT = Config.PORT
+# --- UPDATED PING INTERVAL ---
+PING_INTERVAL = 300  # 5 minutes (in seconds)
 
 class Bot(Client): 
     def __init__(self):
@@ -33,6 +38,33 @@ class Bot(Client):
             bot_token=Config.BOT_TOKEN
         )
         self.log = logging
+
+    # --- ADDED THIS ENTIRE METHOD ---
+    async def self_ping_task(self):
+        """A background task to ping the app's own URL to keep it alive."""
+        if not Config.APP_URL:
+            self.log.warning("APP_URL not set. Self-ping task will not run.")
+            return
+
+        self.log.info(f"Self-ping task started. Pinging {Config.APP_URL} every {PING_INTERVAL}s.")
+        # Wait 30s for the web server to be ready on first boot
+        await asyncio.sleep(30) 
+
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(Config.APP_URL) as response:
+                        if response.status == 200:
+                            self.log.info(f"Self-ping to {Config.APP_URL} successful (Status: {response.status}).")
+                        else:
+                            self.log.warning(f"Self-ping to {Config.APP_URL} returned non-200 status: {response.status}")
+            except aiohttp.ClientError as e:
+                self.log.error(f"Self-ping to {Config.APP_URL} failed: {e}")
+            except Exception as e:
+                self.log.error(f"An unexpected error occurred in self-ping task: {e}", exc_info=True)
+
+            await asyncio.sleep(PING_INTERVAL)
+    # ----------------------------------
 
     async def start(self):
         try:
@@ -50,6 +82,17 @@ class Bot(Client):
         # --- ADD AUTO-RESTART LOGIC HERE ---
         await self.resume_running_tasks()
         # ------------------------------------
+
+        # Start the web server
+        app = web.AppRunner(await web_server())
+        await app.setup()
+        bind_address = "0.0.0.0"
+        await web.TCPSite(app, bind_address, PORT).start()
+        
+        # --- ADDED THIS LINE TO LAUNCH THE TASK ---
+        asyncio.create_task(self.self_ping_task())
+        # ------------------------------------------
+        
         await idle()
 
     async def stop(self, *args):
